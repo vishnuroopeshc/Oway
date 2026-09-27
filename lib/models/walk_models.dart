@@ -38,12 +38,19 @@ class WalkSummary {
   final int elapsedSeconds;
   final int steps;
   final double newAreaKm;
+  final double distanceKm;
   final List<LatLng> routePoints;
+
+  /// One entry per consecutive pair in [routePoints]: true when that segment
+  /// first crossed into never-before-visited territory.
+  final List<bool> segmentIsNew;
 
   WalkSummary({
     required this.elapsedSeconds,
     required this.steps,
     required this.newAreaKm,
+    required this.distanceKm,
     required this.routePoints,
+    required this.segmentIsNew,
   });
 }

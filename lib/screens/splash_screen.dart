@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import '../theme/app_colors.dart';
 import 'home_screen.dart';
 
 class SplashScreen extends StatelessWidget {
@@ -39,7 +39,7 @@ class SplashScreen extends StatelessWidget {
                   height: 56,
                   child: ElevatedButton(
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF4F4F4F),
+                      backgroundColor: AppColors.neutralDark,
                       foregroundColor: Colors.white,
                       elevation: 4,
                       shape: RoundedRectangleBorder(
@@ -47,9 +47,9 @@ class SplashScreen extends StatelessWidget {
                       ),
                     ),
                     onPressed: () => _continue(context),
-                    child: Text(
+                    child: const Text(
                       'Continue',
-                      style: GoogleFonts.inter(
+                      style: TextStyle(
                         fontSize: 24,
                         fontWeight: FontWeight.w600,
                       ),

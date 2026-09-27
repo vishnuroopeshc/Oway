@@ -9,21 +9,25 @@ import 'package:latlong2/latlong.dart';
 import '../models/walk_models.dart';
 import '../services/database_helper.dart';
 import '../services/tracking_service.dart';
+import '../theme/app_colors.dart';
+import '../widgets/stat_column.dart';
 import 'results_screen.dart';
 
-enum _MapStyle { terrain, streets, satellite }
+enum _MapStyle { terrain, streets, satellite, minimal }
 
 extension on _MapStyle {
   String get label => switch (this) {
         _MapStyle.terrain => 'Terrain',
         _MapStyle.streets => 'Streets',
         _MapStyle.satellite => 'Satellite',
+        _MapStyle.minimal => 'Minimal',
       };
 
   IconData get icon => switch (this) {
         _MapStyle.terrain => Icons.terrain,
         _MapStyle.streets => Icons.map_outlined,
         _MapStyle.satellite => Icons.satellite_alt,
+        _MapStyle.minimal => Icons.location_city,
       };
 
   String get urlTemplate => switch (this) {
@@ -31,7 +35,14 @@ extension on _MapStyle {
         _MapStyle.streets => 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
         _MapStyle.satellite =>
           'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        _MapStyle.minimal =>
+          'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}',
       };
+
+  /// Esri's light-gray canvas ships its labels as a separate overlay layer.
+  String? get labelsUrlTemplate => this == _MapStyle.minimal
+      ? 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}'
+      : null;
 
   int get maxNativeZoom => this == _MapStyle.terrain ? 17 : 19;
 
@@ -39,6 +50,7 @@ extension on _MapStyle {
         _MapStyle.terrain => '© OpenTopoMap (CC-BY-SA)',
         _MapStyle.streets => '© OpenStreetMap contributors',
         _MapStyle.satellite => '© Esri, Maxar, Earthstar Geographics',
+        _MapStyle.minimal => '© Esri',
       };
 }
 
@@ -49,17 +61,32 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
+class _HomeScreenState extends State<HomeScreen>
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const LatLng _fallbackCenter = LatLng(37.7749, -122.4194);
 
   final MapController _mapController = MapController();
   final TrackingService _trackingService = TrackingService();
 
+  /// Draws saved routes in progressively once the map/tiles are up, instead
+  /// of popping the full path in the instant data loads.
+  late final AnimationController _routeRevealController = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  );
+  late final Animation<double> _routeReveal = CurvedAnimation(
+    parent: _routeRevealController,
+    curve: Curves.easeOutCubic,
+  );
+
   _MapStyle _mapStyle = _MapStyle.terrain;
 
   bool _loading = true;
   List<SavedRoute> _savedRoutes = [];
-  List<DiscoveryPoint> _savedDiscoveryPoints = [];
+
+  /// Grid cells (see [TrackingService.cellKeyFor]) covered by every walk
+  /// saved before this session started.
+  Set<String> _knownCells = {};
 
   bool _isTracking = false;
   Timer? _timer;
@@ -70,7 +97,28 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   double _newAreaMeters = 0;
   LatLng? _currentPosition;
   final List<LatLng> _liveRoutePoints = [];
+  final List<bool> _liveSegmentIsNew = [];
   final List<LatLng> _sessionDiscoveryPoints = [];
+
+  /// Cells revealed for the first time during the walk in progress.
+  final Set<String> _revealedThisWalk = {};
+  bool _wasInNewTerritory = false;
+
+  Set<String> _computeKnownCells(List<SavedRoute> routes) {
+    final cells = <String>{};
+    for (final route in routes) {
+      for (var i = 0; i < route.points.length; i++) {
+        if (i == 0) {
+          cells.add(TrackingService.cellKeyFor(route.points[i]));
+          continue;
+        }
+        for (final sample in TrackingService.sampleAlong(route.points[i - 1], route.points[i])) {
+          cells.add(TrackingService.cellKeyFor(sample));
+        }
+      }
+    }
+    return cells;
+  }
 
   String get _formattedTime {
     final m = (_seconds ~/ 60).toString();
@@ -90,7 +138,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _trackingService.stop();
     _timer?.cancel();
+    _routeRevealController.dispose();
     super.dispose();
+  }
+
+  /// The first [t] fraction of [points], eased in so a saved route draws
+  /// itself on rather than appearing all at once.
+  List<LatLng> _revealed(List<LatLng> points, double t) {
+    if (points.length < 2 || t >= 1) return points;
+    final count = (points.length * t).ceil().clamp(2, points.length);
+    return points.sublist(0, count);
   }
 
   @override
@@ -104,11 +161,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _loadSavedData() async {
     final routes = await DatabaseHelper.instance.loadAllRoutes();
-    final discoveries = await DatabaseHelper.instance.loadAllDiscoveryPoints();
     if (!mounted) return;
     setState(() {
       _savedRoutes = routes;
-      _savedDiscoveryPoints = discoveries;
+      _knownCells = _computeKnownCells(routes);
       _loading = false;
     });
     if (routes.isNotEmpty && routes.last.points.isNotEmpty) {
@@ -119,6 +175,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         // Map not laid out yet; ignore.
       }
     }
+    // Give the base map tiles a beat to appear before the route draws on.
+    Future.delayed(const Duration(milliseconds: 350), () {
+      if (mounted) _routeRevealController.forward(from: 0);
+    });
   }
 
   void _abandonTracking() {
@@ -127,7 +187,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() {
       _isTracking = false;
       _liveRoutePoints.clear();
+      _liveSegmentIsNew.clear();
       _sessionDiscoveryPoints.clear();
+      _revealedThisWalk.clear();
+      _wasInNewTerritory = false;
       _seconds = 0;
       _steps = 0;
       _distanceMeters = 0;
@@ -150,7 +213,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() {
       _isTracking = true;
       _liveRoutePoints.clear();
+      _liveSegmentIsNew.clear();
       _sessionDiscoveryPoints.clear();
+      _revealedThisWalk.clear();
+      _wasInNewTerritory = false;
       _seconds = 0;
       _steps = 0;
       _distanceMeters = 0;
@@ -197,6 +263,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void _onPosition(Position position) {
     final point = LatLng(position.latitude, position.longitude);
     var segmentDistance = 0.0;
+    var segmentIsNew = false;
 
     if (_liveRoutePoints.isNotEmpty) {
       final prev = _liveRoutePoints.last;
@@ -207,30 +274,36 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         point.longitude,
       );
 
-      final knownPool = [for (final r in _savedRoutes) ...r.points];
-      final minDistToKnown = knownPool.isEmpty
-          ? double.infinity
-          : TrackingService.minDistanceTo(point, knownPool);
-      if (minDistToKnown > TrackingService.newAreaThresholdMeters) {
+      // Walk the cells this segment actually crosses (not just its
+      // endpoint) so a fast GPS jump can't skip over new territory.
+      for (final sample in TrackingService.sampleAlong(prev, point)) {
+        final key = TrackingService.cellKeyFor(sample);
+        if (!_knownCells.contains(key) && _revealedThisWalk.add(key)) {
+          segmentIsNew = true;
+        }
+      }
+      if (segmentIsNew) {
         _newAreaMeters += segmentDistance;
+      }
+    } else {
+      final key = TrackingService.cellKeyFor(point);
+      if (!_knownCells.contains(key)) {
+        _revealedThisWalk.add(key);
       }
     }
 
-    final referencePool = [
-      for (final r in _savedRoutes) ...r.points,
-      ..._sessionDiscoveryPoints,
-    ];
-    final minDistOverall = referencePool.isEmpty
-        ? double.infinity
-        : TrackingService.minDistanceTo(point, referencePool);
-    final justDiscoveredNewArea = minDistOverall > TrackingService.newAreaThresholdMeters;
+    final enteringNewTerritory = segmentIsNew && !_wasInNewTerritory;
+    _wasInNewTerritory = segmentIsNew;
 
     setState(() {
       _distanceMeters += segmentDistance;
       _steps = (_distanceMeters / TrackingService.strideLengthMeters).round();
       _currentPosition = point;
       _liveRoutePoints.add(point);
-      if (justDiscoveredNewArea) {
+      if (_liveRoutePoints.length > 1) {
+        _liveSegmentIsNew.add(segmentIsNew);
+      }
+      if (enteringNewTerritory) {
         _sessionDiscoveryPoints.add(point);
       }
     });
@@ -241,7 +314,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // Ignore if the map isn't ready yet.
     }
 
-    if (justDiscoveredNewArea) {
+    if (enteringNewTerritory) {
       HapticFeedback.mediumImpact();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -296,17 +369,33 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     await DatabaseHelper.instance.saveRoute(route, discoveries);
 
+    final distanceKm = _distanceMeters / 1000;
     final summary = WalkSummary(
       elapsedSeconds: _seconds,
       steps: _steps,
       newAreaKm: _newAreaMeters / 1000,
+      distanceKm: distanceKm,
       routePoints: List.of(_liveRoutePoints),
+      segmentIsNew: List.of(_liveSegmentIsNew),
     );
+
+    double routeDistanceKm(SavedRoute r) =>
+        r.steps * TrackingService.strideLengthMeters / 1000;
+    final priorRoutes = _savedRoutes;
+    final averageDistanceKm = priorRoutes.isEmpty
+        ? null
+        : priorRoutes.map(routeDistanceKm).reduce((a, b) => a + b) / priorRoutes.length;
+    final totalWalks = priorRoutes.length + 1;
+    final totalDistanceKm =
+        priorRoutes.map(routeDistanceKm).fold(0.0, (a, b) => a + b) + distanceKm;
 
     setState(() {
       _isTracking = false;
       _liveRoutePoints.clear();
+      _liveSegmentIsNew.clear();
       _sessionDiscoveryPoints.clear();
+      _revealedThisWalk.clear();
+      _wasInNewTerritory = false;
       _seconds = 0;
       _steps = 0;
       _distanceMeters = 0;
@@ -318,7 +407,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (!mounted) return;
     await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => ResultsScreen(summary: summary)),
+      MaterialPageRoute(
+        builder: (_) => ResultsScreen(
+          summary: summary,
+          totalWalks: totalWalks,
+          totalDistanceKm: totalDistanceKm,
+          averageDistanceKm: averageDistanceKm,
+        ),
+      ),
     );
   }
 
@@ -386,7 +482,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   child: _loading
                       ? Container(
                           width: double.infinity,
-                          color: const Color(0xFFE9E4D8),
+                          color: AppColors.mapPlaceholder,
                           child: const Center(child: CircularProgressIndicator()),
                         )
                       : Stack(
@@ -406,35 +502,36 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                               userAgentPackageName: 'com.example.my_app',
                               maxNativeZoom: _mapStyle.maxNativeZoom,
                             ),
-                            PolylineLayer(
-                              polylines: [
-                                for (final r in _savedRoutes)
-                                  if (r.points.length > 1)
-                                    Polyline(points: r.points, color: Colors.blue, strokeWidth: 4),
-                                if (_liveRoutePoints.length > 1)
-                                  Polyline(
-                                    points: _liveRoutePoints,
-                                    color: Colors.green,
-                                    strokeWidth: 4,
-                                  ),
-                              ],
+                            if (_mapStyle.labelsUrlTemplate != null)
+                              TileLayer(
+                                urlTemplate: _mapStyle.labelsUrlTemplate!,
+                                userAgentPackageName: 'com.example.my_app',
+                                maxNativeZoom: _mapStyle.maxNativeZoom,
+                              ),
+                            AnimatedBuilder(
+                              animation: _routeReveal,
+                              builder: (context, _) => PolylineLayer(
+                                polylines: [
+                                  for (final r in _savedRoutes)
+                                    if (r.points.length > 1)
+                                      Polyline(
+                                        points: _revealed(r.points, _routeReveal.value),
+                                        color: AppColors.savedRoute,
+                                        strokeWidth: 4,
+                                      ),
+                                  for (var i = 0; i < _liveRoutePoints.length - 1; i++)
+                                    Polyline(
+                                      points: [_liveRoutePoints[i], _liveRoutePoints[i + 1]],
+                                      color: (i < _liveSegmentIsNew.length && _liveSegmentIsNew[i])
+                                          ? AppColors.discoveryAmber
+                                          : AppColors.liveRoute,
+                                      strokeWidth: 4,
+                                    ),
+                                ],
+                              ),
                             ),
                             MarkerLayer(
                               markers: [
-                                for (final d in _savedDiscoveryPoints)
-                                  Marker(
-                                    point: d.position,
-                                    width: 14,
-                                    height: 14,
-                                    child: const _DiscoveryDot(),
-                                  ),
-                                for (final p in _sessionDiscoveryPoints)
-                                  Marker(
-                                    point: p,
-                                    width: 14,
-                                    height: 14,
-                                    child: const _DiscoveryDot(),
-                                  ),
                                 if (_currentPosition != null)
                                   Marker(
                                     point: _currentPosition!,
@@ -442,7 +539,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                     height: 18,
                                     child: Container(
                                       decoration: const BoxDecoration(
-                                        color: Color(0xFF3B7DDD),
+                                        color: AppColors.accentBlue,
                                         shape: BoxShape.circle,
                                         border: Border.fromBorderSide(
                                           BorderSide(color: Colors.white, width: 2),
@@ -512,7 +609,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                             const Icon(
                                               Icons.check,
                                               size: 16,
-                                              color: Color(0xFF2E7D32),
+                                              color: AppColors.primaryGreen,
                                             ),
                                           ],
                                         ],
@@ -526,44 +623,39 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         ),
                 ),
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: 8),
+              const _MapLegend(),
+              const SizedBox(height: 8),
               Expanded(
                 flex: 4,
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.fromLTRB(20, 24, 20, 20),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(24),
-                    border: Border.all(color: const Color(0xFFE7E4DC)),
-                  ),
+                child: StatCard(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Row(
                         children: [
                           Expanded(
-                            child: _StatColumn(
+                            child: StatColumn(
                               icon: Icons.access_time,
                               label: 'Time',
                               value: _formattedTime,
                             ),
                           ),
-                          const _StatDivider(),
+                          const StatDivider(),
                           Expanded(
-                            child: _StatColumn(
+                            child: StatColumn(
                               icon: Icons.directions_walk,
                               label: 'Steps',
                               value: '$_steps',
                             ),
                           ),
-                          const _StatDivider(),
+                          const StatDivider(),
                           Expanded(
-                            child: _StatColumn(
+                            child: StatColumn(
                               icon: Icons.navigation_outlined,
                               label: 'GPS',
                               value: gpsOn ? 'ON' : 'OFF',
-                              valueColor: gpsOn ? const Color(0xFF2E7D32) : Colors.black38,
+                              valueColor: gpsOn ? AppColors.primaryGreen : Colors.black38,
                             ),
                           ),
                         ],
@@ -574,9 +666,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         height: 52,
                         child: ElevatedButton(
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: _isTracking
-                                ? const Color(0xFFD64545)
-                                : const Color(0xFF2E7D32),
+                            backgroundColor:
+                                _isTracking ? AppColors.dangerRed : AppColors.primaryGreen,
                             foregroundColor: Colors.white,
                             elevation: 0,
                             shape: RoundedRectangleBorder(
@@ -624,79 +715,48 @@ class _MapCircleButton extends StatelessWidget {
         child: SizedBox(
           width: 40,
           height: 40,
-          child: Icon(icon, size: 20, color: const Color(0xFF3B7DDD)),
+          child: Icon(icon, size: 20, color: AppColors.accentBlue),
         ),
       ),
     );
   }
 }
 
-class _StatColumn extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final String value;
-  final Color? valueColor;
-
-  const _StatColumn({
-    required this.icon,
-    required this.label,
-    required this.value,
-    this.valueColor,
-  });
+class _MapLegend extends StatelessWidget {
+  const _MapLegend();
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(icon, size: 18, color: Colors.black45),
-        const SizedBox(height: 6),
-        Text(
-          value,
-          style: TextStyle(
-            fontSize: 20,
-            fontWeight: FontWeight.w700,
-            color: valueColor ?? Colors.black87,
-          ),
-        ),
-        const SizedBox(height: 2),
-        Text(
-          label,
-          style: const TextStyle(
-            fontSize: 12,
-            fontWeight: FontWeight.w500,
-            color: Colors.black45,
-          ),
-        ),
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: const [
+        _LegendItem(color: AppColors.liveRoute, label: 'Walked before'),
+        SizedBox(width: 16),
+        _LegendItem(color: AppColors.discoveryAmber, label: 'New'),
       ],
     );
   }
 }
 
-class _StatDivider extends StatelessWidget {
-  const _StatDivider();
+class _LegendItem extends StatelessWidget {
+  final Color color;
+  final String label;
+
+  const _LegendItem({required this.color, required this.label});
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: 1,
-      height: 40,
-      color: const Color(0xFFE7E4DC),
-    );
-  }
-}
-
-class _DiscoveryDot extends StatelessWidget {
-  const _DiscoveryDot();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      decoration: const BoxDecoration(
-        color: Color(0xFFFFC107),
-        shape: BoxShape.circle,
-        border: Border.fromBorderSide(BorderSide(color: Colors.white, width: 2)),
-      ),
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 8,
+          height: 8,
+          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+        ),
+        const SizedBox(width: 6),
+        Text(label, style: const TextStyle(fontSize: 11, color: Colors.black54)),
+      ],
     );
   }
 }
