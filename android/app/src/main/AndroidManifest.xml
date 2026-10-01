@@ -2,8 +2,19 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- Lets tracking keep running (with a persistent notification) once the
+         walk screen is backgrounded, instead of being cancelled. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.VIBRATE"/>
+    <!-- Required (Android 10+) to read the phone's built-in step-counter
+         sensor, so step count reflects actual phone movement instead of a
+         distance estimate. -->
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION"/>
     <application
-        android:label="my_app"
+        android:label="Oway"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
@@ -34,6 +45,12 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- Plain native service, no second Flutter engine: see
+             WalkTrackingService.kt for why. -->
+        <service
+            android:name=".WalkTrackingService"
+            android:foregroundServiceType="location"
+            android:exported="false" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

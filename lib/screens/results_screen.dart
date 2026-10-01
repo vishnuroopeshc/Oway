@@ -11,12 +11,14 @@ class ResultsScreen extends StatelessWidget {
   final int totalWalks;
   final double totalDistanceKm;
   final double? averageDistanceKm;
+  final List<double> last7DaysKm;
 
   const ResultsScreen({
     super.key,
     required this.summary,
     required this.totalWalks,
     required this.totalDistanceKm,
+    required this.last7DaysKm,
     this.averageDistanceKm,
   });
 
@@ -28,9 +30,11 @@ class ResultsScreen extends StatelessWidget {
 
   LatLng get _center {
     if (summary.routePoints.isEmpty) return const LatLng(0, 0);
-    final lat = summary.routePoints.map((p) => p.latitude).reduce((a, b) => a + b) /
+    final lat =
+        summary.routePoints.map((p) => p.latitude).reduce((a, b) => a + b) /
         summary.routePoints.length;
-    final lng = summary.routePoints.map((p) => p.longitude).reduce((a, b) => a + b) /
+    final lng =
+        summary.routePoints.map((p) => p.longitude).reduce((a, b) => a + b) /
         summary.routePoints.length;
     return LatLng(lat, lng);
   }
@@ -39,29 +43,35 @@ class ResultsScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final hasComparison = averageDistanceKm != null && averageDistanceKm! > 0;
     final maxCompareKm = hasComparison
-        ? [summary.distanceKm, averageDistanceKm!].reduce((a, b) => a > b ? a : b)
+        ? [
+            summary.distanceKm,
+            averageDistanceKm!,
+          ].reduce((a, b) => a > b ? a : b)
         : summary.distanceKm;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final onScaffoldPrimary = isDark ? Colors.white : Colors.black87;
+    final onScaffoldSecondary = isDark ? Colors.white70 : Colors.black54;
+    final onScaffoldMuted = isDark ? Colors.white54 : Colors.black45;
 
     return Scaffold(
-      backgroundColor: Colors.white,
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(16),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              const Text(
+              Text(
                 'Walk complete',
                 style: TextStyle(
                   fontSize: 28,
                   fontWeight: FontWeight.w700,
-                  color: Colors.black87,
+                  color: onScaffoldPrimary,
                 ),
               ),
               const SizedBox(height: 4),
-              const Text(
+              Text(
                 'Nice work out there',
-                style: TextStyle(fontSize: 14, color: Colors.black54),
+                style: TextStyle(fontSize: 14, color: onScaffoldSecondary),
               ),
               const SizedBox(height: 16),
               ClipRRect(
@@ -72,7 +82,11 @@ class ResultsScreen extends StatelessWidget {
                       ? Container(
                           color: AppColors.mapPlaceholder,
                           child: const Center(
-                            child: Icon(Icons.map_outlined, size: 48, color: Colors.black26),
+                            child: Icon(
+                              Icons.map_outlined,
+                              size: 48,
+                              color: Colors.black26,
+                            ),
                           ),
                         )
                       : FlutterMap(
@@ -91,10 +105,19 @@ class ResultsScreen extends StatelessWidget {
                             ),
                             PolylineLayer(
                               polylines: [
-                                for (var i = 0; i < summary.routePoints.length - 1; i++)
+                                for (
+                                  var i = 0;
+                                  i < summary.routePoints.length - 1;
+                                  i++
+                                )
                                   Polyline(
-                                    points: [summary.routePoints[i], summary.routePoints[i + 1]],
-                                    color: (i < summary.segmentIsNew.length && summary.segmentIsNew[i])
+                                    points: [
+                                      summary.routePoints[i],
+                                      summary.routePoints[i + 1],
+                                    ],
+                                    color:
+                                        (i < summary.segmentIsNew.length &&
+                                            summary.segmentIsNew[i])
                                         ? AppColors.discoveryAmber
                                         : AppColors.liveRoute,
                                     strokeWidth: 4,
@@ -111,7 +134,10 @@ class ResultsScreen extends StatelessWidget {
                                     decoration: BoxDecoration(
                                       color: Colors.white,
                                       shape: BoxShape.circle,
-                                      border: Border.all(color: AppColors.liveRoute, width: 3),
+                                      border: Border.all(
+                                        color: AppColors.liveRoute,
+                                        width: 3,
+                                      ),
                                     ),
                                   ),
                                 ),
@@ -124,7 +150,10 @@ class ResultsScreen extends StatelessWidget {
                                       color: AppColors.accentBlue,
                                       shape: BoxShape.circle,
                                       border: Border.fromBorderSide(
-                                        BorderSide(color: Colors.white, width: 2),
+                                        BorderSide(
+                                          color: Colors.white,
+                                          width: 2,
+                                        ),
                                       ),
                                     ),
                                   ),
@@ -140,7 +169,10 @@ class ResultsScreen extends StatelessWidget {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: const [
-                    _LegendDot(color: AppColors.liveRoute, label: 'Walked before'),
+                    _LegendDot(
+                      color: AppColors.liveRoute,
+                      label: 'Walked before',
+                    ),
                     SizedBox(width: 16),
                     _LegendDot(color: AppColors.discoveryAmber, label: 'New'),
                   ],
@@ -149,14 +181,21 @@ class ResultsScreen extends StatelessWidget {
               if (summary.newAreaKm > 0) ...[
                 const SizedBox(height: 16),
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 14,
+                  ),
                   decoration: BoxDecoration(
                     color: AppColors.discoveryAmber.withValues(alpha: 0.15),
                     borderRadius: BorderRadius.circular(16),
                   ),
                   child: Row(
                     children: [
-                      const Icon(Icons.explore, color: Color(0xFFB8860B), size: 22),
+                      const Icon(
+                        Icons.explore,
+                        color: Color(0xFFB8860B),
+                        size: 22,
+                      ),
                       const SizedBox(width: 10),
                       Expanded(
                         child: Text(
@@ -241,10 +280,12 @@ class ResultsScreen extends StatelessWidget {
                 ),
               ],
               const SizedBox(height: 16),
+              _WeeklyChartCard(last7DaysKm: last7DaysKm),
+              const SizedBox(height: 16),
               Text(
                 '$totalWalks walks · ${totalDistanceKm.toStringAsFixed(1)} km all time',
                 textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 13, color: Colors.black45),
+                style: TextStyle(fontSize: 13, color: onScaffoldMuted),
               ),
               const SizedBox(height: 16),
               SizedBox(
@@ -289,7 +330,15 @@ class _LegendDot extends StatelessWidget {
           decoration: BoxDecoration(color: color, shape: BoxShape.circle),
         ),
         const SizedBox(width: 6),
-        Text(label, style: const TextStyle(fontSize: 11, color: Colors.black54)),
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 11,
+            color: Theme.of(context).brightness == Brightness.dark
+                ? Colors.white70
+                : Colors.black54,
+          ),
+        ),
       ],
     );
   }
@@ -317,10 +366,17 @@ class _ComparisonBar extends StatelessWidget {
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text(label, style: const TextStyle(fontSize: 12, color: Colors.black54)),
+            Text(
+              label,
+              style: const TextStyle(fontSize: 12, color: Colors.black54),
+            ),
             Text(
               '${valueKm.toStringAsFixed(2)} km',
-              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.black87),
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: Colors.black87,
+              ),
             ),
           ],
         ),
@@ -345,6 +401,119 @@ class _ComparisonBar extends StatelessWidget {
               ),
             ),
           ],
+        ),
+      ],
+    );
+  }
+}
+
+class _WeeklyChartCard extends StatelessWidget {
+  final List<double> last7DaysKm;
+
+  const _WeeklyChartCard({required this.last7DaysKm});
+
+  static const _weekdayLetters = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+
+  @override
+  Widget build(BuildContext context) {
+    final maxVal = last7DaysKm.fold<double>(0, (a, b) => b > a ? b : a);
+    final safeMax = maxVal <= 0 ? 1.0 : maxVal;
+    final weekTotal = last7DaysKm.fold<double>(0, (a, b) => a + b);
+    final today = DateTime.now();
+    final n = last7DaysKm.length;
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppColors.cardBorder),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'Last 7 days',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.black54,
+                ),
+              ),
+              Text(
+                '${weekTotal.toStringAsFixed(2)} km',
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.black87,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              for (var i = 0; i < n; i++)
+                Expanded(
+                  child: _DayBar(
+                    ratio: last7DaysKm[i] / safeMax,
+                    isToday: i == n - 1,
+                    letter:
+                        _weekdayLetters[DateTime(
+                              today.year,
+                              today.month,
+                              today.day - (n - 1 - i),
+                            ).weekday -
+                            1],
+                  ),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DayBar extends StatelessWidget {
+  final double ratio;
+  final bool isToday;
+  final String letter;
+
+  const _DayBar({
+    required this.ratio,
+    required this.isToday,
+    required this.letter,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final barHeight = 8.0 + ratio.clamp(0.0, 1.0) * 48.0;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 14,
+          height: barHeight,
+          decoration: BoxDecoration(
+            color: isToday
+                ? AppColors.primaryGreen
+                : AppColors.primaryGreen.withValues(alpha: 0.28),
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          letter,
+          style: TextStyle(
+            fontSize: 11,
+            fontWeight: isToday ? FontWeight.w700 : FontWeight.w500,
+            color: isToday ? AppColors.primaryGreen : Colors.black45,
+          ),
         ),
       ],
     );

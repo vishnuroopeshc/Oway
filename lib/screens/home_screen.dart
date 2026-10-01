@@ -5,39 +5,44 @@ import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:pedometer/pedometer.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:vibration/vibration.dart';
 
 import '../models/walk_models.dart';
+import '../services/background_tracking_service.dart';
 import '../services/database_helper.dart';
+import '../services/location_name_service.dart';
 import '../services/tracking_service.dart';
+import '../services/weather_service.dart';
 import '../theme/app_colors.dart';
 import '../widgets/stat_column.dart';
 import 'results_screen.dart';
+import 'settings_screen.dart';
 
 enum _MapStyle { terrain, streets, satellite, minimal }
 
 extension on _MapStyle {
   String get label => switch (this) {
-        _MapStyle.terrain => 'Terrain',
-        _MapStyle.streets => 'Streets',
-        _MapStyle.satellite => 'Satellite',
-        _MapStyle.minimal => 'Minimal',
-      };
+    _MapStyle.terrain => 'Terrain',
+    _MapStyle.streets => 'Streets',
+    _MapStyle.satellite => 'Satellite',
+    _MapStyle.minimal => 'Minimal',
+  };
 
   IconData get icon => switch (this) {
-        _MapStyle.terrain => Icons.terrain,
-        _MapStyle.streets => Icons.map_outlined,
-        _MapStyle.satellite => Icons.satellite_alt,
-        _MapStyle.minimal => Icons.location_city,
-      };
+    _MapStyle.terrain => Icons.terrain,
+    _MapStyle.streets => Icons.map_outlined,
+    _MapStyle.satellite => Icons.satellite_alt,
+    _MapStyle.minimal => Icons.location_city,
+  };
 
   String get urlTemplate => switch (this) {
-        _MapStyle.terrain => 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
-        _MapStyle.streets => 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-        _MapStyle.satellite =>
-          'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        _MapStyle.minimal =>
-          'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}',
-      };
+    _MapStyle.terrain => 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
+    _MapStyle.streets => 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    _MapStyle.satellite => 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    _MapStyle.minimal => 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+  };
 
   /// Esri's light-gray canvas ships its labels as a separate overlay layer.
   String? get labelsUrlTemplate => this == _MapStyle.minimal
@@ -47,11 +52,11 @@ extension on _MapStyle {
   int get maxNativeZoom => this == _MapStyle.terrain ? 17 : 19;
 
   String get attribution => switch (this) {
-        _MapStyle.terrain => '© OpenTopoMap (CC-BY-SA)',
-        _MapStyle.streets => '© OpenStreetMap contributors',
-        _MapStyle.satellite => '© Esri, Maxar, Earthstar Geographics',
-        _MapStyle.minimal => '© Esri',
-      };
+    _MapStyle.terrain => '© OpenTopoMap (CC-BY-SA)',
+    _MapStyle.streets => '© OpenStreetMap contributors',
+    _MapStyle.satellite => '© Esri, Maxar, Earthstar Geographics',
+    _MapStyle.minimal => '© Esri',
+  };
 }
 
 class HomeScreen extends StatefulWidget {
@@ -84,9 +89,84 @@ class _HomeScreenState extends State<HomeScreen>
   bool _loading = true;
   List<SavedRoute> _savedRoutes = [];
 
+  WeatherDetails? _weatherDetails;
+  String? _locationName;
+
+  /// Always grabs a fresh live GPS fix first (falling back to the last
+  /// known point only if that fails), so weather reflects wherever the
+  /// user currently is standing — not a stale cached location.
+  Future<void> _loadWeather() async {
+    try {
+      final permission = await Geolocator.checkPermission();
+      final granted =
+          permission == LocationPermission.always ||
+          permission == LocationPermission.whileInUse;
+      if (!granted) return;
+      if (!await Geolocator.isLocationServiceEnabled()) return;
+
+      LatLng? point;
+      try {
+        final position = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.low,
+          ),
+        ).timeout(const Duration(seconds: 8));
+        point = LatLng(position.latitude, position.longitude);
+      } catch (_) {
+        point =
+            _currentPosition ??
+            (_savedRoutes.isNotEmpty && _savedRoutes.last.points.isNotEmpty
+                ? _savedRoutes.last.points.last
+                : null);
+      }
+      if (point == null) return;
+
+      final results = await Future.wait([
+        WeatherService.fetchDetails(point.latitude, point.longitude),
+        LocationNameService.reverseGeocode(point.latitude, point.longitude),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _weatherDetails = results[0] as WeatherDetails?;
+        _locationName = results[1] as String?;
+      });
+    } catch (_) {
+      // Weather is a nice-to-have; fail silently.
+    }
+  }
+
+  /// When set, the map only shows routes from this day instead of all of
+  /// history. Picked from the History calendar; date part only.
+  DateTime? _historyFilterDate;
+
   /// Grid cells (see [TrackingService.cellKeyFor]) covered by every walk
   /// saved before this session started.
   Set<String> _knownCells = {};
+
+  bool _isSameDate(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+
+  List<SavedRoute> get _visibleRoutes {
+    final filter = _historyFilterDate;
+    if (filter == null) return _savedRoutes;
+    return [
+      for (final r in _savedRoutes)
+        if (_isSameDate(
+          DateTime.fromMillisecondsSinceEpoch(r.startTime),
+          filter,
+        ))
+          r,
+    ];
+  }
+
+  DateTime _dateOnly(int millisecondsSinceEpoch) {
+    final d = DateTime.fromMillisecondsSinceEpoch(millisecondsSinceEpoch);
+    return DateTime(d.year, d.month, d.day);
+  }
+
+  Set<DateTime> get _daysWithWalks => {
+    for (final r in _savedRoutes) _dateOnly(r.startTime),
+  };
 
   bool _isTracking = false;
   Timer? _timer;
@@ -94,6 +174,16 @@ class _HomeScreenState extends State<HomeScreen>
   int _seconds = 0;
   int _steps = 0;
   double _distanceMeters = 0;
+
+  // Real step counting from the phone's own step-counter sensor (the same
+  // hardware/software pedometer native fitness apps use), rather than
+  // estimating steps from GPS distance. [_stepBaseline] is the sensor's
+  // cumulative count (since device boot) captured when a walk starts;
+  // steps for this walk = latest reading - baseline. Falls back to the
+  // distance estimate in [_onPosition] if the sensor is unavailable.
+  StreamSubscription<StepCount>? _stepCountSub;
+  int? _stepBaseline;
+  bool _hasStepSensor = true;
   double _newAreaMeters = 0;
   LatLng? _currentPosition;
   final List<LatLng> _liveRoutePoints = [];
@@ -104,6 +194,12 @@ class _HomeScreenState extends State<HomeScreen>
   final Set<String> _revealedThisWalk = {};
   bool _wasInNewTerritory = false;
 
+  // Debounce state for the live green/amber color: GPS jitter right at a
+  // grid-cell boundary can flip the raw classification for a single noisy
+  // point, so the displayed color only changes once a flip repeats.
+  bool _displayedIsNew = false;
+  int _pendingFlipStreak = 0;
+
   Set<String> _computeKnownCells(List<SavedRoute> routes) {
     final cells = <String>{};
     for (final route in routes) {
@@ -112,7 +208,10 @@ class _HomeScreenState extends State<HomeScreen>
           cells.add(TrackingService.cellKeyFor(route.points[i]));
           continue;
         }
-        for (final sample in TrackingService.sampleAlong(route.points[i - 1], route.points[i])) {
+        for (final sample in TrackingService.sampleAlong(
+          route.points[i - 1],
+          route.points[i],
+        )) {
           cells.add(TrackingService.cellKeyFor(sample));
         }
       }
@@ -131,6 +230,7 @@ class _HomeScreenState extends State<HomeScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _loadSavedData();
+    _loadWeather();
   }
 
   @override
@@ -138,6 +238,7 @@ class _HomeScreenState extends State<HomeScreen>
     WidgetsBinding.instance.removeObserver(this);
     _trackingService.stop();
     _timer?.cancel();
+    _stopStepCounting();
     _routeRevealController.dispose();
     super.dispose();
   }
@@ -152,11 +253,10 @@ class _HomeScreenState extends State<HomeScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
-      if (_isTracking) {
-        _abandonTracking();
-      }
-    }
+    // Tracking used to be cancelled here on background/detach. Now the
+    // foreground service (started alongside tracking) keeps the walk
+    // recording and shows a persistent notification, so backgrounding the
+    // app no longer interrupts it.
   }
 
   Future<void> _loadSavedData() async {
@@ -184,6 +284,8 @@ class _HomeScreenState extends State<HomeScreen>
   void _abandonTracking() {
     _trackingService.stop();
     _timer?.cancel();
+    _stopStepCounting();
+    BackgroundTrackingService.stop();
     setState(() {
       _isTracking = false;
       _liveRoutePoints.clear();
@@ -191,11 +293,68 @@ class _HomeScreenState extends State<HomeScreen>
       _sessionDiscoveryPoints.clear();
       _revealedThisWalk.clear();
       _wasInNewTerritory = false;
+      _displayedIsNew = false;
+      _pendingFlipStreak = 0;
       _seconds = 0;
       _steps = 0;
       _distanceMeters = 0;
       _newAreaMeters = 0;
     });
+  }
+
+  /// Vibrates the phone's motor directly, bypassing the system "touch
+  /// feedback" haptics toggle that [HapticFeedback] depends on (Samsung
+  /// One UI in particular mutes HapticFeedback when that setting is off).
+  /// Falls back to HapticFeedback if the device reports no vibrator.
+  Future<void> _vibrate({required int durationMs}) async {
+    try {
+      if (await Vibration.hasVibrator()) {
+        Vibration.vibrate(duration: durationMs);
+        return;
+      }
+    } catch (_) {
+      // Fall through to HapticFeedback below.
+    }
+    HapticFeedback.mediumImpact();
+  }
+
+  /// Starts reading the phone's built-in step-counter sensor for this walk.
+  /// The sensor reports a running total since the device last booted, so
+  /// [_stepBaseline] anchors it and every later reading is shown as
+  /// `reading - baseline`. If the sensor/permission isn't available,
+  /// [_onPosition]'s distance-based estimate is used instead.
+  Future<void> _startStepCounting() async {
+    _stepBaseline = null;
+    _hasStepSensor = true;
+    await _stepCountSub?.cancel();
+
+    if (await Permission.activityRecognition.isDenied) {
+      final status = await Permission.activityRecognition.request();
+      if (!status.isGranted) {
+        _hasStepSensor = false;
+        return;
+      }
+    }
+
+    _stepCountSub = Pedometer.stepCountStream.listen(
+      (event) {
+        _stepBaseline ??= event.steps;
+        if (!mounted) return;
+        setState(() {
+          _steps = (event.steps - _stepBaseline!).clamp(0, 1 << 30);
+        });
+      },
+      onError: (_) {
+        _hasStepSensor = false;
+      },
+      cancelOnError: true,
+    );
+  }
+
+  void _stopStepCounting() {
+    _stepCountSub?.cancel();
+    _stepCountSub = null;
+    _stepBaseline = null;
   }
 
   Future<void> _onStartStopPressed() async {
@@ -210,6 +369,16 @@ class _HomeScreenState extends State<HomeScreen>
       return;
     }
 
+    unawaited(_vibrate(durationMs: 40));
+
+    if (await Permission.notification.isDenied) {
+      await Permission.notification.request();
+    }
+    await BackgroundTrackingService.start(
+      title: 'Oway is tracking your walk',
+      text: '0:00 · 0 steps · 0.00 km',
+    );
+
     setState(() {
       _isTracking = true;
       _liveRoutePoints.clear();
@@ -217,6 +386,8 @@ class _HomeScreenState extends State<HomeScreen>
       _sessionDiscoveryPoints.clear();
       _revealedThisWalk.clear();
       _wasInNewTerritory = false;
+      _displayedIsNew = false;
+      _pendingFlipStreak = 0;
       _seconds = 0;
       _steps = 0;
       _distanceMeters = 0;
@@ -224,8 +395,19 @@ class _HomeScreenState extends State<HomeScreen>
       _walkStartTime = DateTime.now();
     });
 
+    _startStepCounting();
+
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() => _seconds++);
+      if (!mounted) return;
+      setState(() => _seconds++);
+      if (_seconds % 3 == 0) {
+        BackgroundTrackingService.update(
+          title: 'Oway is tracking your walk',
+          text:
+              '$_formattedTime · $_steps steps · '
+              '${(_distanceMeters / 1000).toStringAsFixed(2)} km',
+        );
+      }
     });
 
     _trackingService.start(onPosition: _onPosition);
@@ -249,12 +431,21 @@ class _HomeScreenState extends State<HomeScreen>
     }
     try {
       final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+        ),
       );
       final point = LatLng(position.latitude, position.longitude);
       if (!mounted) return;
       setState(() => _currentPosition = point);
-      _mapController.move(point, _mapController.camera.zoom);
+      // Zoom in to a close, street-level view of the user's location; never
+      // zoom back out if they're already closer than that.
+      const locatedZoom = 17.0;
+      final targetZoom = _mapController.camera.zoom < locatedZoom
+          ? locatedZoom
+          : _mapController.camera.zoom;
+      _mapController.move(point, targetZoom);
+      _loadWeather();
     } catch (_) {
       // Ignore transient location errors; the user can try again.
     }
@@ -263,6 +454,7 @@ class _HomeScreenState extends State<HomeScreen>
   void _onPosition(Position position) {
     final point = LatLng(position.latitude, position.longitude);
     var segmentDistance = 0.0;
+    var rawIsNew = false;
     var segmentIsNew = false;
 
     if (_liveRoutePoints.isNotEmpty) {
@@ -275,13 +467,31 @@ class _HomeScreenState extends State<HomeScreen>
       );
 
       // Walk the cells this segment actually crosses (not just its
-      // endpoint) so a fast GPS jump can't skip over new territory.
+      // endpoint) so a fast GPS jump can't skip over new territory. This
+      // bookkeeping is exact — never debounced — so future walks still
+      // know precisely which cells have genuinely been visited.
       for (final sample in TrackingService.sampleAlong(prev, point)) {
         final key = TrackingService.cellKeyFor(sample);
         if (!_knownCells.contains(key) && _revealedThisWalk.add(key)) {
-          segmentIsNew = true;
+          rawIsNew = true;
         }
       }
+
+      // Debounce only the DISPLAYED color/stat: a single noisy GPS point
+      // right at a cell boundary can flip rawIsNew for one segment even
+      // though you haven't actually crossed into new ground. Require the
+      // flip to repeat before it actually shows on the map.
+      if (rawIsNew == _displayedIsNew) {
+        _pendingFlipStreak = 0;
+      } else {
+        _pendingFlipStreak++;
+        if (_pendingFlipStreak >= 2) {
+          _displayedIsNew = rawIsNew;
+          _pendingFlipStreak = 0;
+        }
+      }
+      segmentIsNew = _displayedIsNew;
+
       if (segmentIsNew) {
         _newAreaMeters += segmentDistance;
       }
@@ -297,7 +507,13 @@ class _HomeScreenState extends State<HomeScreen>
 
     setState(() {
       _distanceMeters += segmentDistance;
-      _steps = (_distanceMeters / TrackingService.strideLengthMeters).round();
+      // The real step count comes from the phone's step-counter sensor via
+      // _startStepCounting(); this is only a fallback for devices/permission
+      // states where that sensor isn't available.
+      if (!_hasStepSensor) {
+        _steps = (_distanceMeters / TrackingService.strideLengthMeters)
+            .round();
+      }
       _currentPosition = point;
       _liveRoutePoints.add(point);
       if (_liveRoutePoints.length > 1) {
@@ -315,7 +531,7 @@ class _HomeScreenState extends State<HomeScreen>
     }
 
     if (enteringNewTerritory) {
-      HapticFeedback.mediumImpact();
+      unawaited(_vibrate(durationMs: 40));
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -352,6 +568,9 @@ class _HomeScreenState extends State<HomeScreen>
   Future<void> _stopAndSave() async {
     _trackingService.stop();
     _timer?.cancel();
+    _stopStepCounting();
+    await BackgroundTrackingService.stop();
+    unawaited(_vibrate(durationMs: 80));
 
     final endTime = DateTime.now();
     final route = SavedRoute(
@@ -384,10 +603,12 @@ class _HomeScreenState extends State<HomeScreen>
     final priorRoutes = _savedRoutes;
     final averageDistanceKm = priorRoutes.isEmpty
         ? null
-        : priorRoutes.map(routeDistanceKm).reduce((a, b) => a + b) / priorRoutes.length;
+        : priorRoutes.map(routeDistanceKm).reduce((a, b) => a + b) /
+              priorRoutes.length;
     final totalWalks = priorRoutes.length + 1;
     final totalDistanceKm =
-        priorRoutes.map(routeDistanceKm).fold(0.0, (a, b) => a + b) + distanceKm;
+        priorRoutes.map(routeDistanceKm).fold(0.0, (a, b) => a + b) +
+        distanceKm;
 
     setState(() {
       _isTracking = false;
@@ -396,6 +617,8 @@ class _HomeScreenState extends State<HomeScreen>
       _sessionDiscoveryPoints.clear();
       _revealedThisWalk.clear();
       _wasInNewTerritory = false;
+      _displayedIsNew = false;
+      _pendingFlipStreak = 0;
       _seconds = 0;
       _steps = 0;
       _distanceMeters = 0;
@@ -404,6 +627,7 @@ class _HomeScreenState extends State<HomeScreen>
     });
 
     await _loadSavedData();
+    _loadWeather();
 
     if (!mounted) return;
     await Navigator.of(context).push(
@@ -413,32 +637,66 @@ class _HomeScreenState extends State<HomeScreen>
           totalWalks: totalWalks,
           totalDistanceKm: totalDistanceKm,
           averageDistanceKm: averageDistanceKm,
+          last7DaysKm: _computeLast7DaysKm(),
         ),
       ),
     );
   }
 
+  /// Total distance per day for the last 7 days (oldest first, today last),
+  /// derived from steps the same way [averageDistanceKm] is above.
+  List<double> _computeLast7DaysKm() {
+    final today = DateTime.now();
+    return [
+      for (var i = 6; i >= 0; i--)
+        () {
+          final day = DateTime(today.year, today.month, today.day - i);
+          var total = 0.0;
+          for (final r in _savedRoutes) {
+            if (_isSameDate(_dateOnly(r.startTime), day)) {
+              total += r.steps * TrackingService.strideLengthMeters / 1000;
+            }
+          }
+          return total;
+        }(),
+    ];
+  }
+
   void _showPermissionIssue(LocationAccessResult result) {
+    // A GPS-off issue and a permission-denied issue are different problems
+    // with different fixes, so they get different titles, wording and a
+    // settings button that opens the *correct* settings page for each.
+    final String title;
     final String message;
+    final String actionLabel;
+    final VoidCallback openSettings;
+
     switch (result) {
       case LocationAccessResult.serviceDisabled:
-        message =
-            'Location services are turned off on this device. Please enable them to track your walk.';
+        title = 'Turn on location';
+        message = 'Location is switched off on this device. Turn it on to track your walk.';
+        actionLabel = 'Turn On Location';
+        openSettings = Geolocator.openLocationSettings;
         break;
       case LocationAccessResult.deniedForever:
-        message =
-            'Location access is permanently denied for Trailwise. Please enable it in Settings to track your walk.';
+        title = 'Location access needed';
+        message = 'Location access is permanently denied for Oway. Enable it for this app in Settings to track your walk.';
+        actionLabel = 'Open App Settings';
+        openSettings = Geolocator.openAppSettings;
         break;
       case LocationAccessResult.denied:
       case LocationAccessResult.granted:
-        message = 'Trailwise needs location access to track your walk.';
+        title = 'Location access needed';
+        message = 'Oway needs location access to track your walk.';
+        actionLabel = 'Open App Settings';
+        openSettings = Geolocator.openAppSettings;
         break;
     }
 
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Location access needed'),
+        title: Text(title),
         content: Text(message),
         actions: [
           TextButton(
@@ -448,250 +706,493 @@ class _HomeScreenState extends State<HomeScreen>
           TextButton(
             onPressed: () {
               Navigator.of(ctx).pop();
-              Geolocator.openAppSettings();
+              openSettings();
             },
-            child: const Text('Open Settings'),
+            child: Text(actionLabel),
           ),
         ],
       ),
     );
   }
 
+  Future<void> _confirmExit() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Exit app?'),
+        content: Text(
+          _isTracking
+              ? 'Do you want to exit the application? Your walk in progress will be lost.'
+              : 'Do you want to exit the application?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('No'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Yes'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      if (_isTracking) _abandonTracking();
+      SystemNavigator.pop();
+    }
+  }
+
+  Future<void> _openSettings() async {
+    final dataCleared = await Navigator.of(context)
+        .push<bool>(MaterialPageRoute(builder: (_) => const SettingsScreen()));
+    if (dataCleared == true) {
+      setState(() => _historyFilterDate = null);
+      await _loadSavedData();
+    }
+  }
+
+  Future<void> _openWeatherDetails() async {
+    final details = _weatherDetails;
+    if (details == null) return;
+    await showGeneralDialog(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: 'Weather details',
+      barrierColor: Colors.black26,
+      transitionDuration: const Duration(milliseconds: 320),
+      pageBuilder: (context, animation, secondaryAnimation) =>
+          const SizedBox.shrink(),
+      transitionBuilder: (context, animation, secondaryAnimation, child) {
+        final curved = CurvedAnimation(
+          parent: animation,
+          curve: Curves.easeOutBack,
+        );
+        return FadeTransition(
+          opacity: CurvedAnimation(parent: animation, curve: Curves.easeOut),
+          child: ScaleTransition(
+            scale: Tween<double>(begin: 0.85, end: 1.0).animate(curved),
+            alignment: Alignment.topRight,
+            child: _WeatherDetailSheet(
+              details: details,
+              locationName: _locationName,
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _openHistoryCalendar() async {
+    final picked = await showDialog<Object>(
+      context: context,
+      barrierColor: Colors.black26,
+      builder: (ctx) => _HistoryCalendarDialog(
+        daysWithWalks: _daysWithWalks,
+        selectedDate: _historyFilterDate,
+      ),
+    );
+    if (picked == null || !mounted) return;
+    if (picked == _HistoryCalendarDialog.clearFilter) {
+      setState(() => _historyFilterDate = null);
+      return;
+    }
+    final day = picked as DateTime;
+    setState(() => _historyFilterDate = day);
+    final dayRoutes = _visibleRoutes;
+    if (dayRoutes.isNotEmpty && dayRoutes.last.points.isNotEmpty) {
+      try {
+        _mapController.move(dayRoutes.last.points.last, 15);
+      } catch (_) {
+        // Map not ready yet; ignore.
+      }
+    }
+  }
+
+  // Right-side floating buttons sit above the bottom sheet; this is roughly
+  // the sheet's rendered height (handle + legend + stats + button + padding).
+  static const double _sheetClearance = 280;
+
   @override
   Widget build(BuildContext context) {
     final gpsOn = _isTracking;
 
-    return Scaffold(
-      backgroundColor: Colors.white,
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            children: [
-              Align(
-                alignment: Alignment.centerLeft,
-                child: IconButton(
-                  icon: const Icon(Icons.settings, color: Colors.black87),
-                  onPressed: () {},
-                ),
-              ),
-              Expanded(
-                flex: 5,
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(20),
-                  child: _loading
-                      ? Container(
-                          width: double.infinity,
-                          color: AppColors.mapPlaceholder,
-                          child: const Center(child: CircularProgressIndicator()),
-                        )
-                      : Stack(
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        _confirmExit();
+      },
+      child: Builder(
+        builder: (context) {
+          final isDark = Theme.of(context).brightness == Brightness.dark;
+          final onScaffoldText = isDark ? Colors.white70 : Colors.black54;
+          final onScaffoldIcon = isDark ? Colors.white : Colors.black87;
+          return Scaffold(
+            body: Column(
+              children: [
+                SafeArea(
+                  bottom: false,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        IconButton(
+                          icon: Icon(Icons.settings, color: onScaffoldIcon),
+                          onPressed: _openSettings,
+                        ),
+                        Row(
                           children: [
-                            FlutterMap(
-                          mapController: _mapController,
-                          options: MapOptions(
-                            initialCenter: _currentPosition ??
-                                (_savedRoutes.isNotEmpty && _savedRoutes.last.points.isNotEmpty
-                                    ? _savedRoutes.last.points.last
-                                    : _fallbackCenter),
-                            initialZoom: 15,
-                          ),
-                          children: [
-                            TileLayer(
-                              urlTemplate: _mapStyle.urlTemplate,
-                              userAgentPackageName: 'com.example.my_app',
-                              maxNativeZoom: _mapStyle.maxNativeZoom,
-                            ),
-                            if (_mapStyle.labelsUrlTemplate != null)
-                              TileLayer(
-                                urlTemplate: _mapStyle.labelsUrlTemplate!,
-                                userAgentPackageName: 'com.example.my_app',
-                                maxNativeZoom: _mapStyle.maxNativeZoom,
+                            if (_locationName != null) ...[
+                              Icon(
+                                Icons.location_on,
+                                size: 14,
+                                color: onScaffoldText,
                               ),
-                            AnimatedBuilder(
-                              animation: _routeReveal,
-                              builder: (context, _) => PolylineLayer(
-                                polylines: [
-                                  for (final r in _savedRoutes)
-                                    if (r.points.length > 1)
-                                      Polyline(
-                                        points: _revealed(r.points, _routeReveal.value),
-                                        color: AppColors.savedRoute,
-                                        strokeWidth: 4,
-                                      ),
-                                  for (var i = 0; i < _liveRoutePoints.length - 1; i++)
-                                    Polyline(
-                                      points: [_liveRoutePoints[i], _liveRoutePoints[i + 1]],
-                                      color: (i < _liveSegmentIsNew.length && _liveSegmentIsNew[i])
-                                          ? AppColors.discoveryAmber
-                                          : AppColors.liveRoute,
-                                      strokeWidth: 4,
-                                    ),
-                                ],
-                              ),
-                            ),
-                            MarkerLayer(
-                              markers: [
-                                if (_currentPosition != null)
-                                  Marker(
-                                    point: _currentPosition!,
-                                    width: 18,
-                                    height: 18,
-                                    child: Container(
-                                      decoration: const BoxDecoration(
-                                        color: AppColors.accentBlue,
-                                        shape: BoxShape.circle,
-                                        border: Border.fromBorderSide(
-                                          BorderSide(color: Colors.white, width: 2),
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                              ],
-                            ),
-                            Positioned(
-                              left: 6,
-                              bottom: 4,
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                                color: Colors.white70,
-                                child: Text(
-                                  _mapStyle.attribution,
-                                  style: const TextStyle(fontSize: 9, color: Colors.black54),
+                              const SizedBox(width: 3),
+                              Text(
+                                _locationName!,
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w500,
+                                  color: onScaffoldText,
                                 ),
                               ),
-                            ),
+                              const SizedBox(width: 10),
+                            ],
+                            if (_weatherDetails != null)
+                              _WeatherChip(
+                                weather: _weatherDetails!.current,
+                                onTap: _openWeatherDetails,
+                              ),
                           ],
-                            ),
-                            Positioned(
-                              left: 12,
-                              top: 12,
-                              child: Column(
-                                children: [
-                                  _MapCircleButton(
-                                    icon: Icons.add,
-                                    onTap: () => _zoomBy(1),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: ClipRRect(
+                    borderRadius: const BorderRadius.only(
+                      topLeft: Radius.circular(24),
+                      topRight: Radius.circular(24),
+                    ),
+                    child: Stack(
+                      children: [
+                        Positioned.fill(
+                          child: _loading
+                              ? Container(
+                                  color: AppColors.mapPlaceholder,
+                                  child: const Center(
+                                    child: CircularProgressIndicator(),
                                   ),
-                                  const SizedBox(height: 8),
-                                  _MapCircleButton(
-                                    icon: Icons.remove,
-                                    onTap: () => _zoomBy(-1),
+                                )
+                              : FlutterMap(
+                                  mapController: _mapController,
+                                  options: MapOptions(
+                                    initialCenter:
+                                        _currentPosition ??
+                                        (_savedRoutes.isNotEmpty &&
+                                                _savedRoutes
+                                                    .last
+                                                    .points
+                                                    .isNotEmpty
+                                            ? _savedRoutes.last.points.last
+                                            : _fallbackCenter),
+                                    initialZoom: 15,
                                   ),
-                                ],
-                              ),
-                            ),
-                            Positioned(
-                              right: 12,
-                              bottom: 12,
-                              child: _MapCircleButton(
-                                icon: Icons.my_location,
-                                onTap: _onLocateMePressed,
-                              ),
-                            ),
-                            Positioned(
-                              right: 12,
-                              bottom: 60,
-                              child: PopupMenuButton<_MapStyle>(
-                                tooltip: 'Map style',
-                                initialValue: _mapStyle,
-                                onSelected: (style) => setState(() => _mapStyle = style),
-                                itemBuilder: (context) => [
-                                  for (final style in _MapStyle.values)
-                                    PopupMenuItem(
-                                      value: style,
-                                      child: Row(
-                                        children: [
-                                          Icon(style.icon, size: 18, color: Colors.black87),
-                                          const SizedBox(width: 10),
-                                          Text(style.label),
-                                          if (style == _mapStyle) ...[
-                                            const Spacer(),
-                                            const Icon(
-                                              Icons.check,
-                                              size: 16,
-                                              color: AppColors.primaryGreen,
+                                  children: [
+                                    TileLayer(
+                                      urlTemplate: _mapStyle.urlTemplate,
+                                      userAgentPackageName:
+                                          'com.example.my_app',
+                                      maxNativeZoom: _mapStyle.maxNativeZoom,
+                                    ),
+                                    if (_mapStyle.labelsUrlTemplate != null)
+                                      TileLayer(
+                                        urlTemplate:
+                                            _mapStyle.labelsUrlTemplate!,
+                                        userAgentPackageName:
+                                            'com.example.my_app',
+                                        maxNativeZoom: _mapStyle.maxNativeZoom,
+                                      ),
+                                    AnimatedBuilder(
+                                      animation: _routeReveal,
+                                      builder: (context, _) => PolylineLayer(
+                                        polylines: [
+                                          for (final r in _visibleRoutes)
+                                            if (r.points.length > 1)
+                                              Polyline(
+                                                points: _revealed(
+                                                  r.points,
+                                                  _routeReveal.value,
+                                                ),
+                                                color: AppColors.savedRoute,
+                                                strokeWidth: 4,
+                                              ),
+                                          for (
+                                            var i = 0;
+                                            i < _liveRoutePoints.length - 1;
+                                            i++
+                                          )
+                                            Polyline(
+                                              points: [
+                                                _liveRoutePoints[i],
+                                                _liveRoutePoints[i + 1],
+                                              ],
+                                              color:
+                                                  (i <
+                                                          _liveSegmentIsNew
+                                                              .length &&
+                                                      _liveSegmentIsNew[i])
+                                                  ? AppColors.discoveryAmber
+                                                  : AppColors.liveRoute,
+                                              strokeWidth: 4,
                                             ),
-                                          ],
                                         ],
                                       ),
                                     ),
-                                ],
-                                child: _MapCircleButton(icon: _mapStyle.icon),
+                                    MarkerLayer(
+                                      markers: [
+                                        if (_currentPosition != null)
+                                          Marker(
+                                            point: _currentPosition!,
+                                            width: 18,
+                                            height: 18,
+                                            child: Container(
+                                              decoration: const BoxDecoration(
+                                                color: AppColors.accentBlue,
+                                                shape: BoxShape.circle,
+                                                border: Border.fromBorderSide(
+                                                  BorderSide(
+                                                    color: Colors.white,
+                                                    width: 2,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                        ),
+                        if (!_loading) ...[
+                          Positioned(
+                            left: 12,
+                            top: 12,
+                            child: Column(
+                              children: [
+                                _MapCircleButton(
+                                  icon: Icons.add,
+                                  onTap: () => _zoomBy(1),
+                                ),
+                                const SizedBox(height: 8),
+                                _MapCircleButton(
+                                  icon: Icons.remove,
+                                  onTap: () => _zoomBy(-1),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Positioned(
+                            left: 6,
+                            bottom: _sheetClearance + 4,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 4,
+                                vertical: 1,
+                              ),
+                              color: Colors.white70,
+                              child: Text(
+                                _mapStyle.attribution,
+                                style: const TextStyle(
+                                  fontSize: 9,
+                                  color: Colors.black54,
+                                ),
                               ),
                             ),
-                          ],
-                        ),
-                ),
-              ),
-              const SizedBox(height: 8),
-              const _MapLegend(),
-              const SizedBox(height: 8),
-              Expanded(
-                flex: 4,
-                child: StatCard(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Row(
-                        children: [
-                          Expanded(
-                            child: StatColumn(
-                              icon: Icons.access_time,
-                              label: 'Time',
-                              value: _formattedTime,
+                          ),
+                          Positioned(
+                            right: 12,
+                            bottom: _sheetClearance + 12,
+                            child: _MapCircleButton(
+                              icon: Icons.my_location,
+                              onTap: _onLocateMePressed,
                             ),
                           ),
-                          const StatDivider(),
-                          Expanded(
-                            child: StatColumn(
-                              icon: Icons.directions_walk,
-                              label: 'Steps',
-                              value: '$_steps',
-                            ),
-                          ),
-                          const StatDivider(),
-                          Expanded(
-                            child: StatColumn(
-                              icon: Icons.navigation_outlined,
-                              label: 'GPS',
-                              value: gpsOn ? 'ON' : 'OFF',
-                              valueColor: gpsOn ? AppColors.primaryGreen : Colors.black38,
+                          Positioned(
+                            right: 12,
+                            bottom: _sheetClearance + 60,
+                            child: PopupMenuButton<_MapStyle>(
+                              tooltip: 'Map style',
+                              initialValue: _mapStyle,
+                              onSelected: (style) =>
+                                  setState(() => _mapStyle = style),
+                              itemBuilder: (context) => [
+                                for (final style in _MapStyle.values)
+                                  PopupMenuItem(
+                                    value: style,
+                                    child: Row(
+                                      children: [
+                                        Icon(
+                                          style.icon,
+                                          size: 18,
+                                          color: Colors.black87,
+                                        ),
+                                        const SizedBox(width: 10),
+                                        Text(style.label),
+                                        if (style == _mapStyle) ...[
+                                          const Spacer(),
+                                          const Icon(
+                                            Icons.check,
+                                            size: 16,
+                                            color: AppColors.primaryGreen,
+                                          ),
+                                        ],
+                                      ],
+                                    ),
+                                  ),
+                              ],
+                              child: _MapCircleButton(icon: _mapStyle.icon),
                             ),
                           ),
                         ],
-                      ),
-                      const SizedBox(height: 28),
-                      SizedBox(
-                        width: double.infinity,
-                        height: 52,
-                        child: ElevatedButton(
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor:
-                                _isTracking ? AppColors.dangerRed : AppColors.primaryGreen,
-                            foregroundColor: Colors.white,
-                            elevation: 0,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(26),
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          child: Container(
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: const BorderRadius.only(
+                                topLeft: Radius.circular(24),
+                                topRight: Radius.circular(24),
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withValues(alpha: 0.08),
+                                  blurRadius: 16,
+                                  offset: const Offset(0, -4),
+                                ),
+                              ],
                             ),
-                          ),
-                          onPressed: _onStartStopPressed,
-                          child: Text(
-                            _isTracking ? 'Stop' : 'Start',
-                            style: const TextStyle(
-                              fontSize: 17,
-                              fontWeight: FontWeight.w600,
-                              letterSpacing: 0.3,
+                            child: SafeArea(
+                              top: false,
+                              child: Padding(
+                                padding: const EdgeInsets.fromLTRB(
+                                  20,
+                                  10,
+                                  20,
+                                  20,
+                                ),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Container(
+                                      width: 36,
+                                      height: 4,
+                                      decoration: BoxDecoration(
+                                        color: AppColors.cardBorder,
+                                        borderRadius: BorderRadius.circular(2),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 14),
+                                    Row(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.spaceBetween,
+                                      children: [
+                                        const _MapLegend(),
+                                        _HistoryButton(
+                                          isFiltered:
+                                              _historyFilterDate != null,
+                                          onTap: _openHistoryCalendar,
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 18),
+                                    Row(
+                                      children: [
+                                        Expanded(
+                                          child: StatColumn(
+                                            icon: Icons.access_time,
+                                            label: 'Time',
+                                            value: _formattedTime,
+                                          ),
+                                        ),
+                                        const StatDivider(),
+                                        Expanded(
+                                          child: StatColumn(
+                                            icon: Icons.directions_walk,
+                                            label: 'Steps',
+                                            value: '$_steps',
+                                          ),
+                                        ),
+                                        const StatDivider(),
+                                        Expanded(
+                                          child: StatColumn(
+                                            icon: Icons.trending_up,
+                                            label: 'Distance',
+                                            value:
+                                                '${(_distanceMeters / 1000).toStringAsFixed(2)} km',
+                                          ),
+                                        ),
+                                        const StatDivider(),
+                                        Expanded(
+                                          child: StatColumn(
+                                            icon: Icons.navigation_outlined,
+                                            label: 'GPS',
+                                            value: gpsOn ? 'ON' : 'OFF',
+                                            valueColor: gpsOn
+                                                ? AppColors.primaryGreen
+                                                : Colors.black38,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 20),
+                                    SizedBox(
+                                      width: double.infinity,
+                                      height: 52,
+                                      child: ElevatedButton(
+                                        style: ElevatedButton.styleFrom(
+                                          backgroundColor: _isTracking
+                                              ? AppColors.dangerRed
+                                              : AppColors.primaryGreen,
+                                          foregroundColor: Colors.white,
+                                          elevation: 0,
+                                          shape: RoundedRectangleBorder(
+                                            borderRadius: BorderRadius.circular(
+                                              26,
+                                            ),
+                                          ),
+                                        ),
+                                        onPressed: _onStartStopPressed,
+                                        child: Text(
+                                          _isTracking ? 'Stop' : 'Start',
+                                          style: const TextStyle(
+                                            fontSize: 17,
+                                            fontWeight: FontWeight.w600,
+                                            letterSpacing: 0.3,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
                             ),
                           ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
-              ),
-            ],
-          ),
-        ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
@@ -716,6 +1217,481 @@ class _MapCircleButton extends StatelessWidget {
           width: 40,
           height: 40,
           child: Icon(icon, size: 20, color: AppColors.accentBlue),
+        ),
+      ),
+    );
+  }
+}
+
+class _HistoryButton extends StatelessWidget {
+  final bool isFiltered;
+  final VoidCallback onTap;
+
+  const _HistoryButton({required this.isFiltered, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: isFiltered
+          ? AppColors.primaryGreen.withValues(alpha: 0.12)
+          : AppColors.mapPlaceholder.withValues(alpha: 0.6),
+      borderRadius: BorderRadius.circular(999),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(999),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.calendar_month,
+                size: 16,
+                color: isFiltered ? AppColors.primaryGreen : Colors.black54,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                'History',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: isFiltered ? AppColors.primaryGreen : Colors.black87,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _HistoryCalendarDialog extends StatefulWidget {
+  final Set<DateTime> daysWithWalks;
+  final DateTime? selectedDate;
+
+  /// Sentinel returned by [Navigator.pop] when the user asks to clear the
+  /// day filter instead of picking one.
+  static const Object clearFilter = _ClearFilterMarker();
+
+  const _HistoryCalendarDialog({
+    required this.daysWithWalks,
+    this.selectedDate,
+  });
+
+  @override
+  State<_HistoryCalendarDialog> createState() => _HistoryCalendarDialogState();
+}
+
+class _ClearFilterMarker {
+  const _ClearFilterMarker();
+}
+
+class _HistoryCalendarDialogState extends State<_HistoryCalendarDialog> {
+  late DateTime _displayedMonth;
+
+  static const _weekdayLabels = [
+    'Sun',
+    'Mon',
+    'Tue',
+    'Wed',
+    'Thu',
+    'Fri',
+    'Sat',
+  ];
+  static const _monthNames = [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    final base = widget.selectedDate ?? DateTime.now();
+    _displayedMonth = DateTime(base.year, base.month);
+  }
+
+  void _shiftMonth(int delta) {
+    setState(() {
+      _displayedMonth = DateTime(
+        _displayedMonth.year,
+        _displayedMonth.month + delta,
+      );
+    });
+  }
+
+  bool _isSameDate(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+
+  @override
+  Widget build(BuildContext context) {
+    final today = DateTime.now();
+    final firstOfMonth = DateTime(
+      _displayedMonth.year,
+      _displayedMonth.month,
+      1,
+    );
+    final daysInMonth = DateTime(
+      _displayedMonth.year,
+      _displayedMonth.month + 1,
+      0,
+    ).day;
+    final leadingBlanks = firstOfMonth.weekday % 7;
+
+    return Dialog(
+      backgroundColor: Colors.white,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 340),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.chevron_left),
+                      onPressed: () => _shiftMonth(-1),
+                    ),
+                    Expanded(
+                      child: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        child: Text(
+                          '${_monthNames[_displayedMonth.month - 1]} ${_displayedMonth.year}',
+                          textAlign: TextAlign.center,
+                          maxLines: 1,
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.chevron_right),
+                      onPressed: () => _shiftMonth(1),
+                    ),
+                  ],
+                ),
+                Row(
+                  children: [
+                    for (final label in _weekdayLabels)
+                      Expanded(
+                        child: Center(
+                          child: Text(
+                            label,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: Colors.black45,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                GridView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 7,
+                    mainAxisExtent: 44,
+                  ),
+                  itemCount: leadingBlanks + daysInMonth,
+                  itemBuilder: (context, index) {
+                    if (index < leadingBlanks) return const SizedBox.shrink();
+                    final day = index - leadingBlanks + 1;
+                    final date = DateTime(
+                      _displayedMonth.year,
+                      _displayedMonth.month,
+                      day,
+                    );
+                    final hasWalk = widget.daysWithWalks.any(
+                      (d) => _isSameDate(d, date),
+                    );
+                    final isSelected =
+                        widget.selectedDate != null &&
+                        _isSameDate(widget.selectedDate!, date);
+                    final isToday = _isSameDate(today, date);
+
+                    return InkWell(
+                      borderRadius: BorderRadius.circular(999),
+                      onTap: hasWalk
+                          ? () => Navigator.of(context).pop(date)
+                          : null,
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Container(
+                            width: 32,
+                            height: 32,
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: isSelected ? AppColors.accentBlue : null,
+                              border: isToday && !isSelected
+                                  ? Border.all(
+                                      color: AppColors.accentBlue,
+                                      width: 1.4,
+                                    )
+                                  : null,
+                            ),
+                            child: Text(
+                              '$day',
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w500,
+                                color: isSelected
+                                    ? Colors.white
+                                    : hasWalk
+                                    ? Colors.black87
+                                    : Colors.black26,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Container(
+                            width: 5,
+                            height: 5,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: hasWalk
+                                  ? AppColors.primaryGreen
+                                  : Colors.transparent,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+                const SizedBox(height: 8),
+                TextButton(
+                  onPressed: () =>
+                      Navigator.of(context)
+                          .pop(_HistoryCalendarDialog.clearFilter),
+                  child: const Text('Show all days'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+IconData weatherIconFor(int code) {
+  if (code == 0) return Icons.wb_sunny;
+  if (code <= 2) return Icons.wb_cloudy;
+  if (code == 3) return Icons.cloud;
+  if (code == 45 || code == 48) return Icons.blur_on;
+  if (code >= 51 && code <= 67) return Icons.grain;
+  if (code >= 80 && code <= 82) return Icons.grain;
+  if (code >= 71 && code <= 86) return Icons.ac_unit;
+  if (code >= 95) return Icons.bolt;
+  return Icons.wb_cloudy;
+}
+
+class _WeatherChip extends StatelessWidget {
+  final CurrentWeather weather;
+  final VoidCallback onTap;
+
+  const _WeatherChip({required this.weather, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppColors.mapPlaceholder.withValues(alpha: 0.6),
+      borderRadius: BorderRadius.circular(999),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(999),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                weatherIconFor(weather.weatherCode),
+                size: 16,
+                color: Colors.black54,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                '${weather.temperatureC.round()}°C',
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.black87,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _WeatherDetailSheet extends StatelessWidget {
+  final WeatherDetails details;
+  final String? locationName;
+
+  const _WeatherDetailSheet({required this.details, this.locationName});
+
+  String _hourLabel(DateTime time) {
+    final now = DateTime.now();
+    if (time.hour == now.hour && time.day == now.day) return 'Now';
+    final h = time.hour % 12 == 0 ? 12 : time.hour % 12;
+    final suffix = time.hour < 12 ? 'AM' : 'PM';
+    return '$h$suffix';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final current = details.current;
+    return Align(
+      alignment: Alignment.topCenter,
+      child: Padding(
+        padding: const EdgeInsets.only(top: 90, left: 20, right: 20),
+        child: Material(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(24),
+          elevation: 10,
+          shadowColor: Colors.black38,
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (locationName != null) ...[
+                  Text(
+                    locationName!,
+                    style: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.black87,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                ],
+                Row(
+                  children: [
+                    Icon(
+                      weatherIconFor(current.weatherCode),
+                      size: 44,
+                      color: AppColors.neutralDark,
+                    ),
+                    const SizedBox(width: 14),
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          '${current.temperatureC.round()}°C',
+                          style: const TextStyle(
+                            fontSize: 36,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.black87,
+                            height: 1.0,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          WeatherService.labelFor(current.weatherCode),
+                          style: const TextStyle(
+                            fontSize: 14,
+                            color: Colors.black54,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const Spacer(),
+                    Text(
+                      'Feels like\n${current.feelsLikeC.round()}°C',
+                      textAlign: TextAlign.right,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.black45,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+                if (details.hourly.isNotEmpty) ...[
+                  const SizedBox(height: 20),
+                  const Divider(height: 1, color: AppColors.cardBorder),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'HOURLY FORECAST',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.6,
+                      color: Colors.black45,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    height: 86,
+                    child: ListView.separated(
+                      scrollDirection: Axis.horizontal,
+                      itemCount: details.hourly.length,
+                      separatorBuilder: (context, index) =>
+                          const SizedBox(width: 18),
+                      itemBuilder: (context, i) {
+                        final h = details.hourly[i];
+                        return Column(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              _hourLabel(h.time),
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: i == 0
+                                    ? FontWeight.w700
+                                    : FontWeight.w500,
+                                color: i == 0
+                                    ? AppColors.primaryGreen
+                                    : Colors.black54,
+                              ),
+                            ),
+                            Icon(
+                              weatherIconFor(h.weatherCode),
+                              size: 20,
+                              color: AppColors.neutralDark,
+                            ),
+                            Text(
+                              '${h.temperatureC.round()}°',
+                              style: const TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.black87,
+                              ),
+                            ),
+                          ],
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -755,7 +1731,10 @@ class _LegendItem extends StatelessWidget {
           decoration: BoxDecoration(color: color, shape: BoxShape.circle),
         ),
         const SizedBox(width: 6),
-        Text(label, style: const TextStyle(fontSize: 11, color: Colors.black54)),
+        Text(
+          label,
+          style: const TextStyle(fontSize: 11, color: Colors.black54),
+        ),
       ],
     );
   }

@@ -21,7 +21,8 @@ class TrackingService {
   /// The grid-cell key [point] falls into. Longitude spacing is corrected
   /// for latitude so cells stay roughly square away from the equator.
   static String cellKeyFor(LatLng point) {
-    final metersPerDegreeLng = _metersPerDegreeLat * cos(point.latitude * pi / 180);
+    final metersPerDegreeLng =
+        _metersPerDegreeLat * cos(point.latitude * pi / 180);
     final latStep = cellSizeMeters / _metersPerDegreeLat;
     final lngStep = cellSizeMeters / metersPerDegreeLng;
     final row = (point.latitude / latStep).floor();

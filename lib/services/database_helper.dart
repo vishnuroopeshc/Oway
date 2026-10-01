@@ -55,7 +55,10 @@ class DatabaseHelper {
     );
   }
 
-  Future<int> saveRoute(SavedRoute route, List<DiscoveryPoint> discoveries) async {
+  Future<int> saveRoute(
+    SavedRoute route,
+    List<DiscoveryPoint> discoveries,
+  ) async {
     final db = await _database;
     return db.transaction<int>((txn) async {
       final routeId = await txn.insert('routes', {
@@ -102,31 +105,44 @@ class DatabaseHelper {
         whereArgs: [routeId],
         orderBy: 'seq ASC',
       );
-      routes.add(SavedRoute(
-        id: routeId,
-        points: pointRows
-            .map((p) => LatLng(p['lat'] as double, p['lng'] as double))
-            .toList(),
-        startTime: row['start_time'] as int,
-        endTime: row['end_time'] as int,
-        elapsedSeconds: row['elapsed_seconds'] as int,
-        steps: row['steps'] as int,
-        newAreaKm: row['new_area_km'] as double,
-      ));
+      routes.add(
+        SavedRoute(
+          id: routeId,
+          points: pointRows
+              .map((p) => LatLng(p['lat'] as double, p['lng'] as double))
+              .toList(),
+          startTime: row['start_time'] as int,
+          endTime: row['end_time'] as int,
+          elapsedSeconds: row['elapsed_seconds'] as int,
+          steps: row['steps'] as int,
+          newAreaKm: row['new_area_km'] as double,
+        ),
+      );
     }
     return routes;
+  }
+
+  Future<void> clearAllData() async {
+    final db = await _database;
+    await db.transaction((txn) async {
+      await txn.delete('route_points');
+      await txn.delete('discovery_points');
+      await txn.delete('routes');
+    });
   }
 
   Future<List<DiscoveryPoint>> loadAllDiscoveryPoints() async {
     final db = await _database;
     final rows = await db.query('discovery_points');
     return rows
-        .map((r) => DiscoveryPoint(
-              id: r['id'] as int,
-              routeId: r['route_id'] as int,
-              position: LatLng(r['lat'] as double, r['lng'] as double),
-              timestamp: r['timestamp'] as int,
-            ))
+        .map(
+          (r) => DiscoveryPoint(
+            id: r['id'] as int,
+            routeId: r['route_id'] as int,
+            position: LatLng(r['lat'] as double, r['lng'] as double),
+            timestamp: r['timestamp'] as int,
+          ),
+        )
         .toList();
   }
 }
