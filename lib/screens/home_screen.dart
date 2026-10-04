@@ -505,11 +505,16 @@ class _HomeScreenState extends State<HomeScreen>
   void _onPosition(Position position) {
     final held = _heldJump;
     _heldJump = null;
+    // The next fix carrying on from the held jump (rather than snapping back
+    // toward where we were) means the jump was real movement — this also
+    // keeps fast, steady movement with sparse fixes from stalling.
     if (held != null &&
-        _metersTo(LatLng(held.latitude, held.longitude), position) <=
-            _jumpHoldMeters) {
+        _liveRoutePoints.isNotEmpty &&
+        _metersTo(LatLng(held.latitude, held.longitude), position) <
+            _metersTo(_liveRoutePoints.last, position)) {
       _acceptPosition(held);
-    } else if (_liveRoutePoints.isNotEmpty &&
+    }
+    if (_liveRoutePoints.isNotEmpty &&
         _metersTo(_liveRoutePoints.last, position) > _jumpHoldMeters) {
       _heldJump = position;
       return;

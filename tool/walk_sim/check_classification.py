@@ -37,7 +37,7 @@ def explored(nodes, p, max_marker=None):
     )
 
 
-JUMP_HOLD = 30.0  # a single fix jumping farther than this is held for one fix
+JUMP_HOLD = 30.0  # a fix jumping farther is held until the next fix confirms it
 
 
 def run_walk(plan, known):
@@ -55,9 +55,14 @@ def run_walk(plan, known):
         p = (x, y)
         if held is not None:
             h, held = held, None
-            if math.dist(h[2:], p) <= JUMP_HOLD:
+            if math.dist(h[2:], p) < math.dist(pts[-1], p):
                 accepted.append(h)
-        elif math.dist(pts[-1], p) > JUMP_HOLD:
+        while accepted:
+            label_, expect_, ax, ay = accepted.pop(0)
+            displayed_new, streak, pending = _process(
+                (ax, ay), label_, expect_, pts, segs, known, session, pending,
+                displayed_new, streak)
+        if math.dist(pts[-1], p) > JUMP_HOLD:
             held = (label, expect, x, y)
             continue
         accepted.append((label, expect, x, y))
