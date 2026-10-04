@@ -139,9 +139,9 @@ class _HomeScreenState extends State<HomeScreen>
   /// history. Picked from the History calendar; date part only.
   DateTime? _historyFilterDate;
 
-  /// Grid cells (see [TrackingService.cellKeyFor]) covered by every walk
+  /// Explored-node index (see [ExploredNodeIndex]) built from every walk
   /// saved before this session started.
-  Set<String> _knownCells = {};
+  ExploredNodeIndex _knownIndex = ExploredNodeIndex();
 
   bool _isSameDate(DateTime a, DateTime b) =>
       a.year == b.year && a.month == b.month && a.day == b.day;
@@ -169,6 +169,9 @@ class _HomeScreenState extends State<HomeScreen>
   };
 
   bool _isTracking = false;
+  // True while warming up the GPS for a few seconds before a walk starts,
+  // so the walk's first point isn't a noisy cold-start fix.
+  bool _acquiringGps = false;
   Timer? _timer;
   DateTime? _walkStartTime;
   int _seconds = 0;
@@ -190,33 +193,58 @@ class _HomeScreenState extends State<HomeScreen>
   final List<bool> _liveSegmentIsNew = [];
   final List<LatLng> _sessionDiscoveryPoints = [];
 
-  /// Cells revealed for the first time during the walk in progress.
-  final Set<String> _revealedThisWalk = {};
+  /// Nodes placed during the walk in progress that the walker has since
+  /// moved well away from, so looping back over them later in the same walk
+  /// reads as already-explored without waiting for the walk to be saved.
+  final ExploredNodeIndex _sessionIndex = ExploredNodeIndex();
+
+  /// Nodes placed during this walk that the walker hasn't yet moved
+  /// [_sessionNodeLeaveMeters] away from. GPS fixes land closer together
+  /// (every 5-8m) than the explored radius (10m), so if fresh nodes counted
+  /// immediately, every step onto brand-new ground would fall inside the
+  /// circle the previous step just placed and show green instead of gold.
+  /// Requiring the walker to actually leave a node first is what makes a
+  /// later return a genuine revisit — and unlike a time or path-distance
+  /// delay, standing still with GPS jitter never counts as leaving.
+  final List<LatLng> _pendingSessionNodes = [];
+
+  /// A fix that jumped more than [_jumpHoldMeters] from the last accepted
+  /// one, held back until the next fix shows whether it was real movement
+  /// (next fix agrees with it) or a one-off GPS spike (next fix doesn't).
+  Position? _heldJump;
+  static const double _jumpHoldMeters = 30.0;
   bool _wasInNewTerritory = false;
 
-  // Debounce state for the live green/amber color: GPS jitter right at a
-  // grid-cell boundary can flip the raw classification for a single noisy
-  // point, so the displayed color only changes once a flip repeats.
+  // Debounce state for the live green/amber color: GPS jitter right at the
+  // edge of an explored circle can flip the raw classification for a
+  // single noisy point, so the displayed color only changes once a flip
+  // repeats. A low-accuracy fix is ignored for classification entirely
+  // (though its position still counts for distance/route) rather than
+  // being allowed to start or continue a flip.
   bool _displayedIsNew = false;
   int _pendingFlipStreak = 0;
+  static const double _maxTrustedAccuracyMeters = 25.0;
 
-  Set<String> _computeKnownCells(List<SavedRoute> routes) {
-    final cells = <String>{};
+  // 2x the node radius: far enough that a fresh node can't still be within
+  // radius of the walker's next few steps (even with GPS jitter), small
+  // enough that a real U-turn starts reading green within a few meters.
+  static const double _sessionNodeLeaveMeters =
+      TrackingService.nodeRadiusMeters * 2;
+
+  ExploredNodeIndex _buildExploredIndex(List<SavedRoute> routes) {
+    final index = ExploredNodeIndex();
     for (final route in routes) {
       for (var i = 0; i < route.points.length; i++) {
         if (i == 0) {
-          cells.add(TrackingService.cellKeyFor(route.points[i]));
+          index.add(route.points[i]);
           continue;
         }
-        for (final sample in TrackingService.sampleAlong(
-          route.points[i - 1],
-          route.points[i],
-        )) {
-          cells.add(TrackingService.cellKeyFor(sample));
-        }
+        index.addAll(
+          TrackingService.sampleAlong(route.points[i - 1], route.points[i]),
+        );
       }
     }
-    return cells;
+    return index;
   }
 
   String get _formattedTime {
@@ -264,7 +292,7 @@ class _HomeScreenState extends State<HomeScreen>
     if (!mounted) return;
     setState(() {
       _savedRoutes = routes;
-      _knownCells = _computeKnownCells(routes);
+      _knownIndex = _buildExploredIndex(routes);
       _loading = false;
     });
     if (routes.isNotEmpty && routes.last.points.isNotEmpty) {
@@ -291,7 +319,9 @@ class _HomeScreenState extends State<HomeScreen>
       _liveRoutePoints.clear();
       _liveSegmentIsNew.clear();
       _sessionDiscoveryPoints.clear();
-      _revealedThisWalk.clear();
+      _sessionIndex.clear();
+      _pendingSessionNodes.clear();
+      _heldJump = null;
       _wasInNewTerritory = false;
       _displayedIsNew = false;
       _pendingFlipStreak = 0;
@@ -369,6 +399,11 @@ class _HomeScreenState extends State<HomeScreen>
       return;
     }
 
+    setState(() => _acquiringGps = true);
+    final startFix = await _trackingService.acquireAccurateFix();
+    if (!mounted) return;
+    setState(() => _acquiringGps = false);
+
     unawaited(_vibrate(durationMs: 40));
 
     if (await Permission.notification.isDenied) {
@@ -379,14 +414,30 @@ class _HomeScreenState extends State<HomeScreen>
       text: '0:00 · 0 steps · 0.00 km',
     );
 
+    final startPoint = startFix != null
+        ? LatLng(startFix.latitude, startFix.longitude)
+        : null;
+
     setState(() {
       _isTracking = true;
       _liveRoutePoints.clear();
       _liveSegmentIsNew.clear();
       _sessionDiscoveryPoints.clear();
-      _revealedThisWalk.clear();
+      _sessionIndex.clear();
+      _pendingSessionNodes.clear();
+      _heldJump = null;
       _wasInNewTerritory = false;
       _displayedIsNew = false;
+      if (startPoint != null) {
+        _currentPosition = startPoint;
+        _liveRoutePoints.add(startPoint);
+        if (!_knownIndex.isExplored(startPoint)) {
+          _pendingSessionNodes.add(startPoint);
+          // Start gold on unexplored ground rather than needing the
+          // flip-debounce to catch up over the first couple of fixes.
+          _displayedIsNew = true;
+        }
+      }
       _pendingFlipStreak = 0;
       _seconds = 0;
       _steps = 0;
@@ -452,10 +503,53 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   void _onPosition(Position position) {
+    final held = _heldJump;
+    _heldJump = null;
+    if (held != null &&
+        _metersTo(LatLng(held.latitude, held.longitude), position) <=
+            _jumpHoldMeters) {
+      _acceptPosition(held);
+    } else if (_liveRoutePoints.isNotEmpty &&
+        _metersTo(_liveRoutePoints.last, position) > _jumpHoldMeters) {
+      _heldJump = position;
+      return;
+    }
+    _acceptPosition(position);
+  }
+
+  double _metersTo(LatLng a, Position b) => Geolocator.distanceBetween(
+    a.latitude,
+    a.longitude,
+    b.latitude,
+    b.longitude,
+  );
+
+  /// Moves this walk's pending nodes that the walker is now more than
+  /// [_sessionNodeLeaveMeters] from into [_sessionIndex] (see
+  /// [_pendingSessionNodes] for why they wait).
+  void _promoteLeftSessionNodes(LatLng walker) {
+    _pendingSessionNodes.removeWhere((node) {
+      final left =
+          Geolocator.distanceBetween(
+            walker.latitude,
+            walker.longitude,
+            node.latitude,
+            node.longitude,
+          ) >
+          _sessionNodeLeaveMeters;
+      if (left) _sessionIndex.add(node);
+      return left;
+    });
+  }
+
+  void _acceptPosition(Position position) {
     final point = LatLng(position.latitude, position.longitude);
     var segmentDistance = 0.0;
-    var rawIsNew = false;
+    // Defaults to holding the current classification rather than flipping,
+    // so an untrusted (low-accuracy) fix below can't move it on its own.
+    var rawIsNew = _displayedIsNew;
     var segmentIsNew = false;
+    final trustedFix = position.accuracy <= _maxTrustedAccuracyMeters;
 
     if (_liveRoutePoints.isNotEmpty) {
       final prev = _liveRoutePoints.last;
@@ -466,21 +560,30 @@ class _HomeScreenState extends State<HomeScreen>
         point.longitude,
       );
 
-      // Walk the cells this segment actually crosses (not just its
-      // endpoint) so a fast GPS jump can't skip over new territory. This
-      // bookkeeping is exact — never debounced — so future walks still
-      // know precisely which cells have genuinely been visited.
-      for (final sample in TrackingService.sampleAlong(prev, point)) {
-        final key = TrackingService.cellKeyFor(sample);
-        if (!_knownCells.contains(key) && _revealedThisWalk.add(key)) {
-          rawIsNew = true;
+      if (trustedFix) {
+        _promoteLeftSessionNodes(point);
+        // Walk the ground this segment actually crosses (not just its
+        // endpoint) so a fast GPS jump can't skip over new territory.
+        // Classification is a real geographic-distance check against each
+        // node's explored circle — never raw coordinate comparison, since
+        // two GPS readings of the same spot are never bit-identical.
+        rawIsNew = false;
+        for (final sample in TrackingService.sampleAlong(prev, point)) {
+          final alreadyExplored =
+              _knownIndex.isExplored(sample) ||
+              _sessionIndex.isExplored(sample);
+          if (!alreadyExplored) {
+            _pendingSessionNodes.add(sample);
+            rawIsNew = true;
+          }
         }
       }
 
-      // Debounce only the DISPLAYED color/stat: a single noisy GPS point
-      // right at a cell boundary can flip rawIsNew for one segment even
-      // though you haven't actually crossed into new ground. Require the
-      // flip to repeat before it actually shows on the map.
+      // Debounce only the DISPLAYED color/stat: a single noisy or
+      // low-accuracy GPS point right at the edge of an explored circle can
+      // flip rawIsNew for one segment even though you haven't actually
+      // crossed into new ground. Require the flip to repeat before it
+      // actually shows on the map.
       if (rawIsNew == _displayedIsNew) {
         _pendingFlipStreak = 0;
       } else {
@@ -495,11 +598,8 @@ class _HomeScreenState extends State<HomeScreen>
       if (segmentIsNew) {
         _newAreaMeters += segmentDistance;
       }
-    } else {
-      final key = TrackingService.cellKeyFor(point);
-      if (!_knownCells.contains(key)) {
-        _revealedThisWalk.add(key);
-      }
+    } else if (trustedFix && !_knownIndex.isExplored(point)) {
+      _pendingSessionNodes.add(point);
     }
 
     final enteringNewTerritory = segmentIsNew && !_wasInNewTerritory;
@@ -511,8 +611,7 @@ class _HomeScreenState extends State<HomeScreen>
       // _startStepCounting(); this is only a fallback for devices/permission
       // states where that sensor isn't available.
       if (!_hasStepSensor) {
-        _steps = (_distanceMeters / TrackingService.strideLengthMeters)
-            .round();
+        _steps = (_distanceMeters / TrackingService.strideLengthMeters).round();
       }
       _currentPosition = point;
       _liveRoutePoints.add(point);
@@ -615,7 +714,9 @@ class _HomeScreenState extends State<HomeScreen>
       _liveRoutePoints.clear();
       _liveSegmentIsNew.clear();
       _sessionDiscoveryPoints.clear();
-      _revealedThisWalk.clear();
+      _sessionIndex.clear();
+      _pendingSessionNodes.clear();
+      _heldJump = null;
       _wasInNewTerritory = false;
       _displayedIsNew = false;
       _pendingFlipStreak = 0;
@@ -1161,6 +1262,9 @@ class _HomeScreenState extends State<HomeScreen>
                                               ? AppColors.dangerRed
                                               : AppColors.primaryGreen,
                                           foregroundColor: Colors.white,
+                                          disabledBackgroundColor:
+                                              AppColors.primaryGreen,
+                                          disabledForegroundColor: Colors.white,
                                           elevation: 0,
                                           shape: RoundedRectangleBorder(
                                             borderRadius: BorderRadius.circular(
@@ -1168,15 +1272,43 @@ class _HomeScreenState extends State<HomeScreen>
                                             ),
                                           ),
                                         ),
-                                        onPressed: _onStartStopPressed,
-                                        child: Text(
-                                          _isTracking ? 'Stop' : 'Start',
-                                          style: const TextStyle(
-                                            fontSize: 17,
-                                            fontWeight: FontWeight.w600,
-                                            letterSpacing: 0.3,
-                                          ),
-                                        ),
+                                        onPressed: _acquiringGps
+                                            ? null
+                                            : _onStartStopPressed,
+                                        child: _acquiringGps
+                                            ? const Row(
+                                                mainAxisAlignment:
+                                                    MainAxisAlignment.center,
+                                                children: [
+                                                  SizedBox(
+                                                    width: 18,
+                                                    height: 18,
+                                                    child:
+                                                        CircularProgressIndicator(
+                                                          strokeWidth: 2,
+                                                          color: Colors.white,
+                                                        ),
+                                                  ),
+                                                  SizedBox(width: 12),
+                                                  Text(
+                                                    'Locating…',
+                                                    style: TextStyle(
+                                                      fontSize: 17,
+                                                      fontWeight:
+                                                          FontWeight.w600,
+                                                      letterSpacing: 0.3,
+                                                    ),
+                                                  ),
+                                                ],
+                                              )
+                                            : Text(
+                                                _isTracking ? 'Stop' : 'Start',
+                                                style: const TextStyle(
+                                                  fontSize: 17,
+                                                  fontWeight: FontWeight.w600,
+                                                  letterSpacing: 0.3,
+                                                ),
+                                              ),
                                       ),
                                     ),
                                   ],

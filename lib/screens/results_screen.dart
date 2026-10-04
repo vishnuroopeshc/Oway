@@ -283,7 +283,7 @@ class ResultsScreen extends StatelessWidget {
               _WeeklyChartCard(last7DaysKm: last7DaysKm),
               const SizedBox(height: 16),
               Text(
-                '$totalWalks walks · ${totalDistanceKm.toStringAsFixed(1)} km all time',
+                '$totalWalks ${totalWalks == 1 ? 'walk' : 'walks'} · ${totalDistanceKm.toStringAsFixed(1)} km all time',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 13, color: onScaffoldMuted),
               ),
